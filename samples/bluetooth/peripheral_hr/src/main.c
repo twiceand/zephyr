@@ -9,6 +9,8 @@
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/sys/reboot.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -51,9 +53,103 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	if (err) {
 		printk("Connection failed, err 0x%02x %s\n", err, bt_hci_err_to_str(err));
 	} else {
+		int security_err;
+
 		printk("Connected\n");
 
+		security_err = bt_conn_set_security(conn, BT_SECURITY_L2);
+		if (security_err != 0) {
+			printk("Failed to request security (err %d)\n", security_err);
+		}
+
 		(void)atomic_set_bit(state, STATE_CONNECTED);
+	}
+}
+
+#define BT_UUID_SEC_STATUS_SVC_VAL \
+	BT_UUID_128_ENCODE(0x6b1f0001, 0x4c2a, 0x4f7e, 0x9d3b, 0x5a8c1e2f7a10)
+#define BT_UUID_SEC_STATUS_VAL \
+	BT_UUID_128_ENCODE(0x6b1f0002, 0x4c2a, 0x4f7e, 0x9d3b, 0x5a8c1e2f7a10)
+
+static struct bt_uuid_128 sec_status_svc_uuid = BT_UUID_INIT_128(BT_UUID_SEC_STATUS_SVC_VAL);
+static struct bt_uuid_128 sec_status_uuid = BT_UUID_INIT_128(BT_UUID_SEC_STATUS_VAL);
+
+/* Payload: [0] = achieved security level, [1] = enum bt_security_err (0 on success) */
+static uint8_t sec_status[2];
+
+static ssize_t read_sec_status(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			       void *buf, uint16_t len, uint16_t offset)
+{
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, sec_status, sizeof(sec_status));
+}
+
+static void sec_status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	printk("Security status notification %s\n",
+	       value == BT_GATT_CCC_NOTIFY ? "enabled" : "disabled");
+}
+
+/* Neither the characteristic nor its CCC require encryption, so a central can
+ * subscribe and receive the failure over an unencrypted link.
+ */
+BT_GATT_SERVICE_DEFINE(sec_status_svc,
+	BT_GATT_PRIMARY_SERVICE(&sec_status_svc_uuid),
+	BT_GATT_CHARACTERISTIC(&sec_status_uuid.uuid, BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ, read_sec_status, NULL, NULL),
+	BT_GATT_CCC(sec_status_ccc_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+/* Delay so the status notification is sent before bt_unpair() disconnects the peer */
+#define UNPAIR_DELAY K_MSEC(500)
+
+static struct k_work_delayable unpair_work;
+static bt_addr_le_t unpair_addr;
+static uint8_t unpair_id;
+
+static void unpair_work_handler(struct k_work *work)
+{
+	char addr_str[BT_ADDR_LE_STR_LEN];
+	int unpair_err;
+
+	bt_addr_le_to_str(&unpair_addr, addr_str, sizeof(addr_str));
+
+	unpair_err = bt_unpair(unpair_id, &unpair_addr);
+	if (unpair_err != 0) {
+		printk("Failed to remove bond for %s (err %d)\n", addr_str, unpair_err);
+	} else {
+		printk("Removed bond for %s, rebooting\n", addr_str);
+		/* Let the console flush before the reset */
+		k_sleep(K_MSEC(100));
+		sys_reboot(SYS_REBOOT_COLD);
+	}
+}
+
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+			     enum bt_security_err err)
+{
+	struct bt_conn_info info;
+	int notify_err;
+
+	if (err == 0) {
+		printk("Security changed: %s level %u\n", bt_conn_dst_str(conn), level);
+	} else {
+		printk("Security failed: %s level %u err %s (%d)\n", bt_conn_dst_str(conn), level,
+		       bt_security_err_to_str(err), err);
+	}
+
+	sec_status[0] = (uint8_t)level;
+	sec_status[1] = (uint8_t)err;
+
+	notify_err = bt_gatt_notify_uuid(conn, &sec_status_uuid.uuid, &sec_status_svc.attrs[0],
+					 sec_status, sizeof(sec_status));
+	if (notify_err != 0 && notify_err != -ENOTCONN) {
+		printk("Security status notify failed (err %d)\n", notify_err);
+	}
+
+	if (err != 0 && bt_conn_get_info(conn, &info) == 0) {
+		unpair_id = info.id;
+		bt_addr_le_copy(&unpair_addr, bt_conn_get_dst(conn));
+		k_work_reschedule(&unpair_work, UNPAIR_DELAY);
 	}
 }
 
@@ -67,6 +163,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.security_changed = security_changed,
 };
 
 static void hrs_ntf_changed(bool enabled)
@@ -185,9 +282,31 @@ static void blink_stop(void)
 #endif /* LED0_NODE */
 #endif /* CONFIG_GPIO */
 
+#if defined(CONFIG_UART_LINE_CTRL) && DT_HAS_CHOSEN(zephyr_console)
+/* Wait for a host to open the console port, otherwise early output is lost */
+static void console_wait_dtr(void)
+{
+	const struct device *const console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+	uint32_t dtr = 0U;
+
+	if (!device_is_ready(console)) {
+		return;
+	}
+
+	for (int i = 0; i < 100 && dtr == 0U; i++) {
+		(void)uart_line_ctrl_get(console, UART_LINE_CTRL_DTR, &dtr);
+		k_sleep(K_MSEC(100));
+	}
+}
+#endif
+
 int main(void)
 {
 	int err;
+
+#if defined(CONFIG_UART_LINE_CTRL) && DT_HAS_CHOSEN(zephyr_console)
+	console_wait_dtr();
+#endif
 
 	err = bt_enable(NULL);
 	if (err) {
@@ -198,6 +317,8 @@ int main(void)
 	printk("Bluetooth initialized\n");
 
 	bt_conn_auth_cb_register(&auth_cb_display);
+
+	k_work_init_delayable(&unpair_work, unpair_work_handler);
 
 	bt_hrs_cb_register(&hrs_cb);
 

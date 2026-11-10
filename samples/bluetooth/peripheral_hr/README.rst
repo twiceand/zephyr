@@ -38,3 +38,23 @@ Building a minimal variant for bbc_microbit
    :board: bbc_microbit
    :goals: build
    :gen-args: -DCONF_FILE=prj_minimal.conf -DEXTRA_CONF_FILE=overlay-bt_ll_sw_split-minimal.conf
+
+Using USB CDC ACM for the console
+---------------------------------
+
+For boards with a USB device controller, the console can be routed to a USB CDC
+ACM serial port by applying the CDC ACM configuration and devicetree overlay:
+
+.. zephyr-app-commands::
+   :zephyr-app: samples/bluetooth/peripheral_hr
+   :board: reel_board
+   :goals: build flash
+   :gen-args: -DEXTRA_CONF_FILE=overlay-cdc-acm.conf -DDTC_OVERLAY_FILE=cdc-acm.overlay
+
+Connect the board to a host over USB and open the enumerated CDC ACM serial
+port to view the sample output. The selected board must provide the
+``zephyr_udc0`` devicetree node. The sample waits up to 10 seconds for the host
+to open the port (DTR) before starting Bluetooth, so that early output is not lost.
+
+Boards that already use CDC ACM as their default console, such as
+``nrf52840dongle``, need no overlay; build them without the extra arguments.
