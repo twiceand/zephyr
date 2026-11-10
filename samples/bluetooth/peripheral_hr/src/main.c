@@ -48,18 +48,79 @@ enum {
 
 static ATOMIC_DEFINE(state, STATE_BITS);
 
+static struct k_work_delayable security_work;
+static struct k_spinlock security_lock;
+static struct bt_conn *security_pending_conn;
+
+#define SECURITY_REQUEST_DELAY K_SECONDS(1)
+
+static void cancel_security_request(struct bt_conn *conn)
+{
+	struct bt_conn *pending_conn = NULL;
+	k_spinlock_key_t key;
+
+	(void)k_work_cancel_delayable(&security_work);
+
+	key = k_spin_lock(&security_lock);
+	if (security_pending_conn == conn) {
+		pending_conn = security_pending_conn;
+		security_pending_conn = NULL;
+	}
+	k_spin_unlock(&security_lock, key);
+
+	if (pending_conn != NULL) {
+		bt_conn_unref(pending_conn);
+	}
+}
+
+static void security_work_handler(struct k_work *work)
+{
+	struct bt_conn *conn;
+	k_spinlock_key_t key;
+	int err;
+
+	ARG_UNUSED(work);
+
+	key = k_spin_lock(&security_lock);
+	conn = security_pending_conn;
+	security_pending_conn = NULL;
+	k_spin_unlock(&security_lock, key);
+
+	if (conn == NULL) {
+		return;
+	}
+
+	if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
+		err = bt_conn_set_security(conn, BT_SECURITY_L2);
+		if (err != 0) {
+			printk("Failed to request security (err %d)\n", err);
+		}
+	}
+
+	bt_conn_unref(conn);
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err) {
 		printk("Connection failed, err 0x%02x %s\n", err, bt_hci_err_to_str(err));
 	} else {
-		int security_err;
+		struct bt_conn *old_conn = NULL;
+		k_spinlock_key_t key;
 
 		printk("Connected\n");
 
-		security_err = bt_conn_set_security(conn, BT_SECURITY_L2);
-		if (security_err != 0) {
-			printk("Failed to request security (err %d)\n", security_err);
+		if (bt_conn_get_security(conn) < BT_SECURITY_L2) {
+			key = k_spin_lock(&security_lock);
+			old_conn = security_pending_conn;
+			security_pending_conn = bt_conn_ref(conn);
+			k_spin_unlock(&security_lock, key);
+
+			if (old_conn != NULL) {
+				bt_conn_unref(old_conn);
+			}
+
+			(void)k_work_reschedule(&security_work, SECURITY_REQUEST_DELAY);
 		}
 
 		(void)atomic_set_bit(state, STATE_CONNECTED);
@@ -130,6 +191,8 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 	struct bt_conn_info info;
 	int notify_err;
 
+	cancel_security_request(conn);
+
 	if (err == 0) {
 		printk("Security changed: %s level %u\n", bt_conn_dst_str(conn), level);
 	} else {
@@ -157,6 +220,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	printk("Disconnected, reason 0x%02x %s\n", reason, bt_hci_err_to_str(reason));
 
+	cancel_security_request(conn);
+
 	(void)atomic_set_bit(state, STATE_DISCONNECTED);
 }
 
@@ -183,8 +248,20 @@ static void auth_cancel(struct bt_conn *conn)
 	printk("Pairing cancelled: %s\n", bt_conn_dst_str(conn));
 }
 
+static enum bt_security_err pairing_accept(
+	struct bt_conn *conn, const struct bt_conn_pairing_feat *const feat)
+{
+	ARG_UNUSED(feat);
+
+	printk("Peer initiated pairing: %s\n", bt_conn_dst_str(conn));
+	cancel_security_request(conn);
+
+	return BT_SECURITY_ERR_SUCCESS;
+}
+
 static struct bt_conn_auth_cb auth_cb_display = {
 	.cancel = auth_cancel,
+	.pairing_accept = pairing_accept,
 };
 
 static void bas_notify(void)
@@ -318,6 +395,7 @@ int main(void)
 
 	bt_conn_auth_cb_register(&auth_cb_display);
 
+	k_work_init_delayable(&security_work, security_work_handler);
 	k_work_init_delayable(&unpair_work, unpair_work_handler);
 
 	bt_hrs_cb_register(&hrs_cb);
